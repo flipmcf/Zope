@@ -16,6 +16,7 @@
 import sys
 from contextlib import closing
 from contextlib import contextmanager
+from contextlib import AbstractContextManager
 from io import BytesIO
 from io import IOBase
 
@@ -151,7 +152,7 @@ def _exc_view_created_response(exc, request, response):
     return False
 
 
-class Transaction_Pubevents_Context(object):
+class Transaction_Pubevents_Context(AbstractContextManager['Transaction_Pubevents_Context']):
 
     def __init__(self,request, response, tm=transaction.manager):
         self.request = request
