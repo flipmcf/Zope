@@ -151,23 +151,42 @@ def _exc_view_created_response(exc, request, response):
     return False
 
 
-@contextmanager
-def transaction_pubevents(request, response, tm=transaction.manager):
-    try:
-        setDefaultSkin(request)
-        newInteraction()
-        tm.begin()
-        notify(pubevents.PubStart(request))
+class Transaction_Pubevents_Context(object):
 
-        yield
+    def __init__(self,request, response, tm=transaction.manager):
+        self.request = request
+        self.response = response
+        self.tm = tm
 
-        notify(pubevents.PubBeforeCommit(request))
-        if tm.isDoomed():
-            tm.abort()
-        else:
-            tm.commit()
-        notify(pubevents.PubSuccess(request))
-    except Exception as exc:
+    def __enter__(self):
+        try:
+            setDefaultSkin(self.request)
+            newInteraction()
+            self.tm.begin()
+            notify(pubevents.PubStart(self.request))
+        except Exception as exc:
+            self.handle_exception(exc)
+        finally:
+            endInteraction()
+        return None
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            notify(pubevents.PubBeforeCommit(self.request))
+            if self.tm.isDoomed():
+                self.tm.abort()
+            else:
+                self.tm.commit()
+            notify(pubevents.PubSuccess(self.request))
+        except Exception as exc:
+            self.handle_exception(exc)
+        finally:
+            endInteraction()
+
+        return None
+
+    #TODO:  Exceptions from the '__enter__' should be handled differently than Exceptions from '__exit__'
+    def handle_exception(self, exc):
         # Normalize HTTP exceptions
         # (For example turn zope.publisher NotFound into zExceptions NotFound)
         exc_type, _ = upgradeException(exc.__class__, None)
@@ -177,54 +196,56 @@ def transaction_pubevents(request, response, tm=transaction.manager):
         # Create new exc_info with the upgraded exception.
         exc_info = (exc_type, exc, sys.exc_info()[2])
 
-        try:
-            # Raise exception from app if handle-errors is False
-            # (set by zope.testbrowser in some cases)
-            if request.environ.get('x-wsgiorg.throw_errors', False):
-                reraise(*exc_info)
+        # try: Not Needed Anymore?
 
-            retry = False
-            unauth = False
-            debug_exc = getattr(response, 'debug_exceptions', False)
+        # Raise exception from app if handle-errors is False
+        # (set by zope.testbrowser in some cases)
+        if self.request.environ.get('x-wsgiorg.throw_errors', False):
+            reraise(*exc_info)
 
-            # If the exception is transient and the request can be retried,
-            # shortcut further processing. It makes no sense to have an
-            # exception view registered for this type of exception.
-            if isinstance(exc, TransientError) and request.supports_retry():
-                retry = True
-            else:
-                # Handle exception view. Make sure an exception view that
-                # blows up doesn't leave the user e.g. unable to log in.
-                try:
-                    exc_view_created = _exc_view_created_response(
-                        exc, request, response)
-                except Exception:
-                    exc_view_created = False
+        retry = False
+        unauth = False
+        debug_exc = getattr(self.response, 'debug_exceptions', False)
 
-                # _unauthorized modifies the response in-place. If this hook
-                # is used, an exception view for Unauthorized has to merge
-                # the state of the response and the exception instance.
-                if isinstance(exc, Unauthorized):
-                    unauth = True
-                    exc.setRealm(response.realm)
-                    response._unauthorized()
-                    response.setStatus(exc.getStatus())
+        # If the exception is transient and the request can be retried,
+        # shortcut further processing. It makes no sense to have an
+        # exception view registered for this type of exception.
+        if isinstance(exc, TransientError) and self.request.supports_retry():
+            retry = True
+        else:
+            # Handle exception view. Make sure an exception view that
+            # blows up doesn't leave the user e.g. unable to log in.
+            try:
+                exc_view_created = _exc_view_created_response(
+                    exc, self.request, self.response)
+            except Exception:
+                exc_view_created = False
 
-            # Notify subscribers that this request is failing.
-            notify(pubevents.PubBeforeAbort(request, exc_info, retry))
-            tm.abort()
-            notify(pubevents.PubFailure(request, exc_info, retry))
+            # _unauthorized modifies the response in-place. If this hook
+            # is used, an exception view for Unauthorized has to merge
+            # the state of the response and the exception instance.
+            if isinstance(exc, Unauthorized):
+                unauth = True
+                exc.setRealm(response.realm)
+                self.response._unauthorized()
+                self.response.setStatus(exc.getStatus())
 
-            if retry or \
-               (not unauth and (debug_exc or not exc_view_created)):
-                reraise(*exc_info)
+        # Notify subscribers that this request is failing.
+        notify(pubevents.PubBeforeAbort(request, exc_info, retry))
+        self.tm.abort()
+        notify(pubevents.PubFailure(request, exc_info, retry))
 
-        finally:
-            # Avoid traceback / exception reference cycle.
-            del exc, exc_info
-    finally:
-        endInteraction()
+        if retry or \
+           (not unauth and (debug_exc or not exc_view_created)):
+            reraise(*exc_info)
 
+        #Not needed anymore - it's an actual context manager now.
+        #finally:
+        #    # Avoid traceback / exception reference cycle.
+        #    del exc, exc_info
+
+def transaction_pubevents(request, response, tm=transaction.manager):
+    return Transaction_Pubevents_Context(request, response, tm)
 
 def publish(request, module_info):
     obj, realm, debug_mode = module_info
@@ -369,7 +390,6 @@ def publish_module(environ, start_response,
                 with load_app(module_info) as new_mod_info:
                     with transaction_pubevents(request, response):
                         response = _publish(request, new_mod_info)
-
                         user = getSecurityManager().getUser()
                         if user is not None and \
                            user.getUserName() != 'Anonymous User':
